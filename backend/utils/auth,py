@@ -1,0 +1,74 @@
+from functools import wraps
+from flask import request, jsonify
+import jwt
+from bson.objectid import ObjectId
+from pymongo import MongoClient
+from models.user import User
+
+# =========================
+# Secret Key (Keep this secure in .env in production)
+# =========================
+SECRET_KEY = "your_secret_key"
+
+# =========================
+# Connect to MongoDB
+# =========================
+client = MongoClient('mongodb://localhost:27017/')
+db = client['doctor_assistant']
+
+# =========================
+# Authenticate User and Generate Token
+# =========================
+def authenticate_user(username, password):
+    """Authenticate the user and generate a JWT token."""
+    user_data = db.users.find_one({"username": username})
+
+    # Check if the user exists and password is valid
+    if not user_data or not User.verify_password(password, user_data['password_hash']):
+        return None
+
+    # Create token payload
+    token_payload = {
+        "user_id": str(user_data['_id']),
+        "role": user_data['role'],
+    }
+
+    # Generate JWT token
+    token = jwt.encode(token_payload, SECRET_KEY, algorithm="HS256")
+    return token
+
+
+# =========================
+# Token Required Decorator
+# =========================
+def token_required(f):
+    """Decorator to protect routes using JWT token."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+
+        # Check for token in request headers
+        if "Authorization" in request.headers:
+            token = request.headers["Authorization"].split(" ")[1]  # Format: Bearer <token>
+
+        if not token:
+            return jsonify({"error": "Token is missing!"}), 401
+
+        try:
+            # Decode the token
+            data = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            current_user = db.users.find_one({"_id": ObjectId(data["user_id"])}, {"password_hash": 0})
+
+            if not current_user:
+                return jsonify({"error": "Invalid token!"}), 401
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token has expired!"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Token is invalid!"}), 401
+        except Exception as e:
+            return jsonify({"error": f"An error occurred: {str(e)}"}), 401
+
+        # Pass the current user to the protected route
+        return f(current_user, *args, **kwargs)
+
+    return decorated
