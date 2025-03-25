@@ -1,74 +1,123 @@
 from flask import Blueprint, request, jsonify
-from pymongo import MongoClient
 from bson import ObjectId
-from datetime import datetime   
-from utils.ai_analyzer import analyze_patient_data
+from models.db import get_db
+from datetime import datetime
+from routes.user_routes import token_required
 
+patient_bp = Blueprint('patients', __name__)
 
-
-
-patient_bp = Blueprint('patient', __name__)
-
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['doctor_assistant']
-
-# Get all patients
 @patient_bp.route('/', methods=['GET'])
-def get_patients():
-    patients = list(db.patients.find({}))
-    for patient in patients:
-        patient['_id'] = str(patient['_id'])
-    return jsonify(patients)
+@token_required
+def get_patients(current_user):
+    """Get all patients."""
+    try:
+        db = get_db()
+        query = {}
+        
+        # If doctor, only show their patients
+        if current_user['role'] == 'doctor':
+            query['doctor_id'] = str(current_user['_id'])
+            
+        patients = list(db.patients.find(query))
+        for patient in patients:
+            patient['_id'] = str(patient['_id'])
+            if 'doctor_id' in patient:
+                patient['doctor_id'] = str(patient['doctor_id'])
+        return jsonify(patients), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-# Get a patient by ID
-@patient_bp.route('/<string:patient_id>', methods=['GET'])
-def get_patient(current_user, patient_id):
-    patient = db.patients.find_one({"_id": ObjectId(patient_id)})
-    if patient:
-        return jsonify({"patient": patient}), 200
-    else:
-        return jsonify({"error": "Patient not found"}), 404
+@patient_bp.route('/', methods=['POST'])
+@token_required
+def add_patient(current_user):
+    """Add a new patient."""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'message': 'No data provided'}), 400
+            
+        required_fields = ['name', 'email', 'phone', 'address', 'date_of_birth']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'message': f'Missing required field: {field}'}), 400
+        
+        # If doctor is adding patient, set doctor_id
+        if current_user['role'] == 'doctor':
+            data['doctor_id'] = str(current_user['_id'])
+        elif 'doctor_id' in data:
+            # If admin is adding patient with specific doctor
+            data['doctor_id'] = str(data['doctor_id'])
+            
+        # Add creation timestamp
+        data['created_at'] = datetime.utcnow()
+        
+        db = get_db()
+        # Check if email already exists
+        if db.patients.find_one({'email': data['email']}):
+            return jsonify({'message': 'Patient with this email already exists'}), 400
+            
+        result = db.patients.insert_one(data)
+        return jsonify({
+            'message': 'Patient added successfully',
+            '_id': str(result.inserted_id)
+        }), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-# Add a new patient
-@patient_bp.route('/add', methods=['POST'])
-def add_patient():
-    data = request.json
-    admin_id = data.get('created_by')
-    if not admin_id:
-        return jsonify({"error": "Admin ID required"}), 400
+@patient_bp.route('/<patient_id>', methods=['PUT'])
+@token_required
+def update_patient(current_user, patient_id):
+    """Update patient information."""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'message': 'No data provided'}), 400
+            
+        db = get_db()
+        query = {'_id': ObjectId(patient_id)}
+        
+        # If doctor, only allow updating their own patients
+        if current_user['role'] == 'doctor':
+            query['doctor_id'] = str(current_user['_id'])
+            
+        # Don't allow changing doctor_id if current user is a doctor
+        if current_user['role'] == 'doctor' and 'doctor_id' in data:
+            return jsonify({'message': 'Unauthorized: Cannot change patient\'s doctor'}), 403
+            
+        # If email is being updated, check it doesn't conflict
+        if 'email' in data:
+            existing = db.patients.find_one({'email': data['email'], '_id': {'$ne': ObjectId(patient_id)}})
+            if existing:
+                return jsonify({'message': 'Another patient with this email already exists'}), 400
+                
+        result = db.patients.update_one(query, {'$set': data})
+        
+        if result.modified_count:
+            return jsonify({'message': 'Patient updated successfully'}), 200
+        return jsonify({'message': 'Patient not found or unauthorized'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-    patient_id = db.patients.insert_one(data).inserted_id
-    return jsonify({"message": "Patient added successfully", "patient_id": str(patient_id)})
-
-
-# Update patient data
-@patient_bp.route('/update/<string:patient_id>', methods=['PUT'])
-def update_patient(patient_id):
-    data = request.json
-    db.patients.update_one({"_id": ObjectId(patient_id)}, {"$set": data})
-    return jsonify({"message": "Patient updated successfully"})
-
-# Delete a patient
-@patient_bp.route('/delete/<string:patient_id>', methods=['DELETE'])
-def delete_patient(patient_id):
-    result = db.patients.delete_one({"_id": ObjectId(patient_id)})
-    if result.deleted_count == 1:
-        return jsonify({"message": "Patient deleted successfully"})
-    return jsonify({"error": "Patient not found"}), 404
-
-# Update Medications & Conditions - Doctor Route
-@patient_bp.route('/update-medications/<string:patient_id>', methods=['POST'])
-def update_medications(patient_id):
-    data = request.json
-    update_data = {
-        "medications": data.get('medications'),
-        "current_conditions": data.get('current_conditions'),
-        "doctor_notes": data.get('doctor_notes')
-    }
-
-    result = db.patients.update_one({"_id": ObjectId(patient_id)}, {"$set": update_data})
-    if result.matched_count == 1:
-        return jsonify({"message": "Medications and conditions updated successfully"})
-    else:
-        return jsonify({"error": "Patient not found"}), 404
+@patient_bp.route('/<patient_id>', methods=['DELETE'])
+@token_required
+def delete_patient(current_user, patient_id):
+    """Delete a patient."""
+    try:
+        db = get_db()
+        query = {'_id': ObjectId(patient_id)}
+        
+        # If doctor, only allow deleting their own patients
+        if current_user['role'] == 'doctor':
+            query['doctor_id'] = str(current_user['_id'])
+            
+        # Check if patient has any appointments
+        if db.appointments.find_one({'patient_id': ObjectId(patient_id)}):
+            return jsonify({'message': 'Cannot delete patient with existing appointments'}), 400
+            
+        result = db.patients.delete_one(query)
+        
+        if result.deleted_count:
+            return jsonify({'message': 'Patient deleted successfully'}), 200
+        return jsonify({'message': 'Patient not found or unauthorized'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

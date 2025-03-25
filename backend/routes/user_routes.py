@@ -1,157 +1,176 @@
 from flask import Blueprint, request, jsonify
-from pymongo import MongoClient
-from models.user import User
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt
+from datetime import datetime, timedelta
 from bson import ObjectId
-from ..utils.auth import authenticate_user, token_required
+from db import mongo
 
-# ================================
-# Initialize Blueprint and MongoDB
-# ================================
 user_bp = Blueprint('user', __name__)
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['doctor_assistant']
+# Secret key for JWT - in production, use environment variable
+SECRET_KEY = 'your-secret-key'
 
-# ================================
-# Register a new user (Admin Only)
-# ================================
 @user_bp.route('/register', methods=['POST'])
-@token_required
-def register_user(current_user):
-    """Admin creates a new user."""
-    if current_user['role'] != 'admin':
-        return jsonify({"error": "Unauthorized! Admin access required"}), 403
+def register():
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        if not all(k in data for k in ['username', 'email', 'password', 'role']):
+            return jsonify({'message': 'Missing required fields'}), 400
+        
+        # Validate role
+        if data['role'] not in ['doctor', 'admin']:
+            return jsonify({'message': 'Invalid role. Must be either doctor or admin'}), 400
+        
+        # Check if username or email already exists
+        if mongo.db.users.find_one({'username': data['username']}):
+            return jsonify({'message': 'Username already exists'}), 400
+        if mongo.db.users.find_one({'email': data['email']}):
+            return jsonify({'message': 'Email already exists'}), 400
+        
+        # Hash password and create user
+        hashed_password = generate_password_hash(data['password'])
+        user = {
+            'username': data['username'],
+            'email': data['email'],
+            'password': hashed_password,
+            'role': data['role'],
+            'created_at': datetime.utcnow()
+        }
+        
+        result = mongo.db.users.insert_one(user)
+        user_id = str(result.inserted_id)
+        
+        # Generate token
+        token = jwt.encode({
+            'user_id': user_id,
+            'username': user['username'],
+            'role': user['role'],
+            'exp': datetime.utcnow() + timedelta(days=1)
+        }, SECRET_KEY)
+        
+        return jsonify({
+            'message': 'User registered successfully',
+            'token': token,
+            'username': user['username'],
+            'role': user['role'],
+            '_id': user_id
+        }), 201
+        
+    except Exception as e:
+        print(f"Registration error: {str(e)}")
+        return jsonify({'message': 'An error occurred during registration'}), 500
 
-    data = request.json
-    username = data.get('username')
-    email = data.get('email')
-    password = data.get('password')
-    role = data.get('role', 'doctor')
-
-    if not username or not email or not password:
-        return jsonify({"error": "Missing required fields"}), 400
-
-    if User.find_by_username(db, username):
-        return jsonify({"error": "Username already exists"}), 400
-
-    user_id = User.create_user(db, username, email, password, role)
-    return jsonify({"message": "User registered successfully", "user_id": str(user_id)}), 201
-
-
-# ================================
-# Login user
-# ================================
 @user_bp.route('/login', methods=['POST'])
-def login_user():
-    """Authenticate and login user."""
-    data = request.json
-    username = data.get("username")
-    password = data.get("password")
+def login():
+    try:
+        data = request.get_json()
+        
+        if not all(k in data for k in ['username', 'password']):
+            return jsonify({'message': 'Missing username or password'}), 400
+        
+        user = mongo.db.users.find_one({'username': data['username']})
+        if not user:
+            return jsonify({'message': 'Invalid username or password'}), 401
+            
+        if not check_password_hash(user['password'], data['password']):
+            return jsonify({'message': 'Invalid username or password'}), 401
+        
+        # Generate token
+        token = jwt.encode({
+            'user_id': str(user['_id']),
+            'username': user['username'],
+            'role': user['role'],
+            'exp': datetime.utcnow() + timedelta(days=1)
+        }, SECRET_KEY)
+        
+        return jsonify({
+            'token': token,
+            'username': user['username'],
+            'role': user['role']
+        }), 200
+        
+    except Exception as e:
+        print(f"Login error: {str(e)}")
+        return jsonify({'message': 'An error occurred during login'}), 500
 
-    token = authenticate_user(username, password)
-    if token:
-        return jsonify({"token": token}), 200
-    else:
-        return jsonify({"error": "Invalid username or password"}), 401
+def token_required(f):
+    def decorated(*args, **kwargs):
+        token = None
+        auth_header = request.headers.get('Authorization')
+        
+        if auth_header:
+            try:
+                token = auth_header.split(" ")[1]
+            except IndexError:
+                return jsonify({'message': 'Invalid token format'}), 401
+        
+        if not token:
+            return jsonify({'message': 'Token is missing'}), 401
+            
+        try:
+            data = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+            current_user = mongo.db.users.find_one({'_id': ObjectId(data['user_id'])})
+            if not current_user:
+                return jsonify({'message': 'Invalid token'}), 401
+        except jwt.ExpiredSignatureError:
+            return jsonify({'message': 'Token has expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'message': 'Invalid token'}), 401
+        except Exception as e:
+            return jsonify({'message': 'Token validation failed'}), 401
+            
+        return f(current_user, *args, **kwargs)
+    
+    decorated.__name__ = f.__name__
+    return decorated
 
-
-# ================================
-# Get all users (Admin Only)
-# ================================
-@user_bp.route('/', methods=['GET'])
+@user_bp.route('/profile', methods=['GET'])
 @token_required
-def get_users(current_user):
-    """Retrieve all users (admin only)."""
-    if current_user['role'] != 'admin':
-        return jsonify({"error": "Unauthorized! Admin access required"}), 403
+def get_profile(current_user):
+    return jsonify({
+        'username': current_user['username'],
+        'email': current_user['email'],
+        'role': current_user['role']
+    }), 200
 
-    users = list(db.users.find({}, {"password_hash": 0}))
-    for user in users:
-        user['_id'] = str(user['_id'])
-    return jsonify(users), 200
-
-
-# ================================
-# Get user by ID (Admin/Doctor)
-# ================================
-@user_bp.route('/<string:user_id>', methods=['GET'])
+@user_bp.route('/doctors', methods=['GET'])
 @token_required
-def get_user(current_user, user_id):
-    """Retrieve a single user by ID."""
-    user = db.users.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0})
-    if user:
-        user['_id'] = str(user['_id'])
-        return jsonify(user), 200
-    return jsonify({"error": "User not found"}), 404
+def get_doctors(current_user):
+    try:
+        # Only admin can access this endpoint
+        if current_user['role'] != 'admin':
+            return jsonify({'message': 'Unauthorized access'}), 403
+            
+        doctors = list(mongo.db.users.find({'role': 'doctor'}))
+        # Convert ObjectId to string for JSON serialization
+        for doctor in doctors:
+            doctor['_id'] = str(doctor['_id'])
+            # Remove password from response
+            doctor.pop('password', None)
+        
+        return jsonify(doctors), 200
+    except Exception as e:
+        print(f"Error fetching doctors: {str(e)}")
+        return jsonify({'message': 'An error occurred while fetching doctors'}), 500
 
-
-# ================================
-# Update user info (Admin Only)
-# ================================
-@user_bp.route('/update/<string:user_id>', methods=['PUT'])
+@user_bp.route('/doctors/<doctor_id>', methods=['DELETE'])
 @token_required
-def update_user(current_user, user_id):
-    """Update user information (admin only)."""
-    if current_user['role'] != 'admin':
-        return jsonify({"error": "Unauthorized! Admin access required"}), 403
-
-    data = request.json
-    update_data = {}
-
-    if 'username' in data:
-        update_data['username'] = data['username']
-    if 'email' in data:
-        update_data['email'] = data['email']
-    if 'role' in data:
-        update_data['role'] = data['role']
-
-    result = db.users.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
-
-    if result.modified_count == 0:
-        return jsonify({"error": "No changes were made or user not found"}), 404
-
-    return jsonify({"message": "User updated successfully"}), 200
-
-
-# ================================
-# Delete user (Admin Only)
-# ================================
-@user_bp.route('/delete/<string:user_id>', methods=['DELETE'])
-@token_required
-def delete_user(current_user, user_id):
-    """Delete a user by ID (admin only)."""
-    if current_user['role'] != 'admin':
-        return jsonify({"error": "Unauthorized! Admin access required"}), 403
-
-    result = db.users.delete_one({"_id": ObjectId(user_id)})
-    if result.deleted_count == 0:
-        return jsonify({"error": "User not found"}), 404
-
-    return jsonify({"message": "User deleted successfully"}), 200
-
-
-# ================================
-# Change User Password (Self Update)
-# ================================
-@user_bp.route('/change-password', methods=['POST'])
-@token_required
-def change_password(current_user):
-    """Allow users to change their own password."""
-    data = request.json
-    current_password = data.get("current_password")
-    new_password = data.get("new_password")
-
-    # Validate current password
-    user = User.find_by_username(db, current_user['username'])
-    if not user or not user.check_password(current_password):
-        return jsonify({"error": "Incorrect current password"}), 403
-
-    # Update password hash
-    new_password_hash = User.generate_hash(new_password)
-    db.users.update_one(
-        {"_id": ObjectId(current_user['_id'])},
-        {"$set": {"password_hash": new_password_hash}}
-    )
-
-    return jsonify({"message": "Password updated successfully"}), 200
+def delete_doctor(current_user, doctor_id):
+    try:
+        # Only admin can delete doctors
+        if current_user['role'] != 'admin':
+            return jsonify({'message': 'Unauthorized access'}), 403
+            
+        result = mongo.db.users.delete_one({
+            '_id': ObjectId(doctor_id),
+            'role': 'doctor'
+        })
+        
+        if result.deleted_count:
+            return jsonify({'message': 'Doctor deleted successfully'}), 200
+        return jsonify({'message': 'Doctor not found'}), 404
+    except Exception as e:
+        print(f"Error deleting doctor: {str(e)}")
+        return jsonify({'message': 'An error occurred while deleting doctor'}), 500 
